@@ -434,6 +434,15 @@
     box-shadow: 0 8px 0 rgba(0,0,0,.4);
   }
   #startBtn:active{ transform:translateY(4px); box-shadow:0 4px 0 rgba(0,0,0,.4); }
+  #saveStatus{
+    margin-top:18px;
+    color: var(--straw);
+    font-size:13px;
+    letter-spacing:1px;
+    text-transform:uppercase;
+    min-height:16px;
+    opacity:.9;
+  }
   #howTo{
     margin-top:28px;
     color: var(--parchment);
@@ -495,6 +504,7 @@
 <div id="startScreen">
   <h1>HORSE BAGGER</h1>
   <div class="tagline">Catch horses. Get paid. Buy better bags.</div>
+  <div id="saveStatus"></div>
   <button id="startBtn">Start Bagging</button>
   <div id="howTo">
     <b>WASD / Arrows</b> to move &nbsp;&nbsp; <b>Mouse</b> to look &nbsp;&nbsp; <b>Click</b> to throw your bag &nbsp;&nbsp; <b>Space</b> to jump &nbsp;&nbsp; <b>Tab</b> to open the Bag Shop<br>
@@ -524,6 +534,7 @@ const HORSE_NOTICE_RADIUS = 13;     // distance at which a horse starts fleeing
 const HORSE_CALM_SPEED = 1.4;
 const HORSE_FLEE_SPEED = 6.4;
 const HORSE_RESPAWN_DELAY = 4.5;    // seconds after a catch before a new horse spawns
+const HORSE_BODY_RADIUS = 0.65;     // approx half-width for obstacle collision
 
 const BAGS = [
   { id:'burlap',     name:'Burlap Sack',            color:0xb5905a, price:0,    range:17, speed:27, cooldown:1.05, catchRadius:1.7, payMult:1.0, payBase:[8,16],  ability:'none',      tag:'Starter',
@@ -567,6 +578,45 @@ const S = {
 function equippedBag(){ return BAGS.find(b => b.id === S.equippedBagId); }
 
 // ---------------------------------------------------------------
+// SAVE / LOAD (localStorage autosave)
+// ---------------------------------------------------------------
+const SAVE_KEY = 'horseBaggerSave';
+
+function saveGame(){
+  try{
+    const data = {
+      cash: S.cash,
+      catchCount: S.catchCount,
+      ownedBags: Array.from(S.ownedBags),
+      equippedBagId: S.equippedBagId
+    };
+    localStorage.setItem(SAVE_KEY, JSON.stringify(data));
+  }catch(err){
+    console.warn('Could not save game:', err && err.message);
+  }
+}
+
+function loadGame(){
+  try{
+    const raw = localStorage.getItem(SAVE_KEY);
+    if(!raw) return;
+    const data = JSON.parse(raw);
+    if(typeof data.cash === 'number') S.cash = data.cash;
+    if(typeof data.catchCount === 'number') S.catchCount = data.catchCount;
+    if(Array.isArray(data.ownedBags) && data.ownedBags.length){
+      S.ownedBags = new Set(data.ownedBags);
+    }
+    if(typeof data.equippedBagId === 'string' && S.ownedBags.has(data.equippedBagId)){
+      S.equippedBagId = data.equippedBagId;
+    }
+  }catch(err){
+    console.warn('Could not load saved game:', err && err.message);
+  }
+}
+
+loadGame();
+
+// ---------------------------------------------------------------
 // THREE.JS SETUP
 // ---------------------------------------------------------------
 const canvas = document.getElementById('gameCanvas');
@@ -588,6 +638,7 @@ function resize(){
   renderer.setSize(window.innerWidth, window.innerHeight);
 }
 window.addEventListener('resize', resize);
+window.addEventListener('beforeunload', saveGame);
 resize();
 
 // ---- Lighting ----
@@ -686,6 +737,27 @@ const fenceGroup = new THREE.Group();
 scene.add(fenceGroup);
 
 // ---- Scenery: scattered rocks, bushes, a barn silhouette ----
+// ---------------------------------------------------------------
+// OBSTACLES (rocks, bushes) — simple circle colliders on the XZ plane
+// ---------------------------------------------------------------
+const obstacles = []; // { x, z, radius }
+
+function resolveObstacleCollisions(pos, bodyRadius){
+  for(let i=0;i<obstacles.length;i++){
+    const ob = obstacles[i];
+    const dx = pos.x - ob.x, dz = pos.z - ob.z;
+    const distSq = dx*dx + dz*dz;
+    const minDist = ob.radius + bodyRadius;
+    if(distSq < minDist*minDist){
+      const dist = Math.sqrt(distSq) || 0.0001;
+      const overlap = minDist - dist;
+      const nx = dx / dist, nz = dz / dist;
+      pos.x += nx * overlap;
+      pos.z += nz * overlap;
+    }
+  }
+}
+
 function addScenery(){
   const rockMat = new THREE.MeshStandardMaterial({ color:0x8a8478, roughness:1 });
   const bushMat = new THREE.MeshStandardMaterial({ color:0x4a6b3a, roughness:1 });
@@ -700,12 +772,14 @@ function addScenery(){
       rock.rotation.set(Math.random()*6, Math.random()*6, Math.random()*6);
       rock.castShadow = true; rock.receiveShadow = true;
       scene.add(rock);
+      obstacles.push({ x, z, radius: s*0.85 });
     } else {
       const s = 0.6 + Math.random()*0.8;
       const bush = new THREE.Mesh(new THREE.IcosahedronGeometry(s, 0), bushMat);
       bush.position.set(x, s*0.6, z);
       bush.castShadow = true;
       scene.add(bush);
+      obstacles.push({ x, z, radius: s*0.8 });
     }
   }
 
@@ -879,6 +953,7 @@ function updatePlayer(dt){
     move.addScaledVector(right, mx * speed * dt);
     player.pos.add(move);
     clampToWorld(player.pos);
+    resolveObstacleCollisions(player.pos, player.radius);
   }
 
   // gravity / jump
@@ -901,61 +976,156 @@ function updatePlayer(dt){
 // ---------------------------------------------------------------
 function buildHorseMesh(colorHex){
   const g = new THREE.Group();
-  const bodyMat = new THREE.MeshStandardMaterial({ color: colorHex, roughness:0.8 });
-  const maneMat = new THREE.MeshStandardMaterial({ color: 0x1d140e, roughness:0.9 });
-  const hoofMat = new THREE.MeshStandardMaterial({ color: 0x2a2018, roughness:0.9 });
+  const bodyMat = new THREE.MeshStandardMaterial({ color: colorHex, roughness:0.75 });
+  const darkMat = new THREE.MeshStandardMaterial({ color: shadeColor(colorHex, -0.35), roughness:0.85 });
+  const maneMat = new THREE.MeshStandardMaterial({ color: 0x1d140e, roughness:0.95 });
+  const hoofMat = new THREE.MeshStandardMaterial({ color: 0x1a1410, roughness:0.9 });
+  const muzzleMat = new THREE.MeshStandardMaterial({ color: 0x2e1f17, roughness:0.85 });
 
-  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.55, 1.5, 8), bodyMat);
-  body.rotation.z = Math.PI/2;
-  body.position.set(0, 0.95, 0);
-  body.castShadow = true;
-  g.add(body);
-  // rounded caps on the body so it reads as a capsule, not a tin can
-  const bodyCapFront = new THREE.Mesh(new THREE.SphereGeometry(0.55, 8, 8), bodyMat);
-  bodyCapFront.position.set(0.75, 0.95, 0);
-  g.add(bodyCapFront);
-  const bodyCapBack = new THREE.Mesh(new THREE.SphereGeometry(0.55, 8, 8), bodyMat);
-  bodyCapBack.position.set(-0.75, 0.95, 0);
-  g.add(bodyCapBack);
+  // ---- Torso: tapered barrel, narrower at the haunches than the chest ----
+  const torso = new THREE.Group();
+  const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.46, 0.52, 1.55, 10), bodyMat);
+  barrel.rotation.z = Math.PI/2;
+  barrel.castShadow = true;
+  torso.add(barrel);
+  // chest cap (front, slightly larger/rounder)
+  const chestCap = new THREE.Mesh(new THREE.SphereGeometry(0.52, 10, 8), bodyMat);
+  chestCap.position.set(0.77, 0, 0);
+  chestCap.scale.set(0.9, 1, 1);
+  chestCap.castShadow = true;
+  torso.add(chestCap);
+  // haunch cap (rear, rounded rump)
+  const haunchCap = new THREE.Mesh(new THREE.SphereGeometry(0.47, 10, 8), bodyMat);
+  haunchCap.position.set(-0.77, 0, 0);
+  haunchCap.scale.set(0.85, 1.05, 1);
+  haunchCap.castShadow = true;
+  torso.add(haunchCap);
+  // underbelly slight bulge
+  const belly = new THREE.Mesh(new THREE.SphereGeometry(0.4, 8, 6), bodyMat);
+  belly.position.set(0, -0.22, 0);
+  belly.scale.set(1.2, 0.7, 0.95);
+  torso.add(belly);
 
-  const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.28, 0.7, 8), bodyMat);
-  neck.position.set(0.85, 1.35, 0);
-  neck.rotation.z = Math.PI/3.2;
-  neck.castShadow = true;
-  g.add(neck);
+  torso.position.set(0, 1.18, 0);
+  g.add(torso);
 
-  const head = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.4, 0.34), bodyMat);
-  head.position.set(1.28, 1.78, 0);
-  head.castShadow = true;
-  g.add(head);
+  // ---- Neck: arched, tapering up toward the head, tilted forward ----
+  const neckGroup = new THREE.Group();
+  const neckLower = new THREE.Mesh(new THREE.CylinderGeometry(0.33, 0.24, 0.62, 8), bodyMat);
+  neckLower.position.set(0, 0.31, 0);
+  neckLower.castShadow = true;
+  neckGroup.add(neckLower);
+  const neckUpper = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.19, 0.5, 8), bodyMat);
+  neckUpper.position.set(0.08, 0.74, 0);
+  neckUpper.rotation.z = -0.25;
+  neckUpper.castShadow = true;
+  neckGroup.add(neckUpper);
+  neckGroup.position.set(0.62, 1.55, 0);
+  neckGroup.rotation.z = -0.55;
+  g.add(neckGroup);
 
-  const mane = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.7, 0.32), maneMat);
-  mane.position.set(0.78, 1.55, 0);
-  g.add(mane);
+  // ---- Head: muzzle taper, jaw, ears, forelock ----
+  const headGroup = new THREE.Group();
+  const skull = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.32, 0.27), bodyMat);
+  skull.position.set(0, 0, 0);
+  skull.castShadow = true;
+  headGroup.add(skull);
+  const muzzleBridge = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.22, 0.22), bodyMat);
+  muzzleBridge.position.set(0.3, -0.05, 0);
+  muzzleBridge.castShadow = true;
+  headGroup.add(muzzleBridge);
+  const muzzleTip = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.18, 0.2), muzzleMat);
+  muzzleTip.position.set(0.46, -0.08, 0);
+  headGroup.add(muzzleTip);
+  // ears
+  const earGeo = new THREE.ConeGeometry(0.07, 0.22, 6);
+  const earL = new THREE.Mesh(earGeo, bodyMat);
+  earL.position.set(-0.1, 0.23, 0.1);
+  earL.rotation.set(0, 0, -0.25);
+  headGroup.add(earL);
+  const earR = new THREE.Mesh(earGeo, bodyMat);
+  earR.position.set(-0.1, 0.23, -0.1);
+  earR.rotation.set(0, 0, -0.25);
+  headGroup.add(earR);
+  // forelock tuft
+  const forelock = new THREE.Mesh(new THREE.ConeGeometry(0.08, 0.2, 6), maneMat);
+  forelock.position.set(-0.06, 0.14, 0);
+  forelock.rotation.z = Math.PI;
+  headGroup.add(forelock);
 
-  const tail = new THREE.Mesh(new THREE.ConeGeometry(0.16, 0.8, 6), maneMat);
-  tail.position.set(-0.95, 1.05, 0);
-  tail.rotation.z = Math.PI/2.1;
-  g.add(tail);
+  headGroup.position.set(1.18, 2.12, 0);
+  headGroup.rotation.z = -0.2;
+  g.add(headGroup);
 
-  const legPositions = [
-    [0.55, 0.0, 0.32], [0.55, 0.0, -0.32],
-    [-0.55, 0.0, 0.32], [-0.55, 0.0, -0.32]
+  // ---- Mane: a row of overlapping fin-like strands along the neck/head ----
+  const maneStrandGeo = new THREE.BoxGeometry(0.05, 0.34, 0.22);
+  const manePoints = [
+    { pos:[1.0, 2.28, 0], rot:-0.15, scale:1.0 },
+    { pos:[0.84, 2.1, 0],  rot:-0.35, scale:1.05 },
+    { pos:[0.68, 1.86, 0], rot:-0.5,  scale:1.1 },
+    { pos:[0.55, 1.6, 0],  rot:-0.6,  scale:1.1 },
+    { pos:[0.5, 1.32, 0],  rot:-0.65, scale:1.0 },
+    { pos:[0.52, 1.05, 0], rot:-0.7,  scale:0.9 }
+  ];
+  manePoints.forEach(m => {
+    const strand = new THREE.Mesh(maneStrandGeo, maneMat);
+    strand.position.set(m.pos[0], m.pos[1], m.pos[2]);
+    strand.rotation.z = m.rot;
+    strand.scale.setScalar(m.scale);
+    g.add(strand);
+  });
+
+  // ---- Legs: hip-pivot groups so they swing naturally from the body, not the middle ----
+  const legDefs = [
+    { x: 0.5,  z: 0.3,  front:true,  left:true  },
+    { x: 0.5,  z: -0.3, front:true,  left:false },
+    { x: -0.5, z: 0.3,  front:false, left:true  },
+    { x: -0.5, z: -0.3, front:false, left:false }
   ];
   const legs = [];
-  legPositions.forEach((p, idx) => {
-    const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.1, 0.95, 6), bodyMat);
-    leg.position.set(p[0], 0.5, p[2]);
-    leg.castShadow = true;
-    g.add(leg);
-    const hoof = new THREE.Mesh(new THREE.CylinderGeometry(0.13, 0.13, 0.12, 6), hoofMat);
-    hoof.position.set(p[0], 0.04, p[2]);
-    g.add(hoof);
-    legs.push(leg);
+  const hipHeight = 0.76;
+  legDefs.forEach((p) => {
+    const pivot = new THREE.Group();
+    pivot.position.set(p.x, hipHeight, p.z);
+    g.add(pivot);
+
+    const upperLeg = new THREE.Mesh(new THREE.CylinderGeometry(0.13, 0.1, 0.39, 6), bodyMat);
+    upperLeg.position.set(0, -0.195, 0);
+    upperLeg.castShadow = true;
+    pivot.add(upperLeg);
+
+    const kneePivot = new THREE.Group();
+    kneePivot.position.set(0, -0.39, 0);
+    pivot.add(kneePivot);
+
+    const lowerLeg = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.07, 0.3, 6), darkMat);
+    lowerLeg.position.set(0, -0.15, 0);
+    lowerLeg.castShadow = true;
+    kneePivot.add(lowerLeg);
+
+    const hoof = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.11, 0.14, 6), hoofMat);
+    hoof.position.set(0, -0.37, 0);
+    kneePivot.add(hoof);
+
+    legs.push({
+      pivot, kneePivot, front:p.front, left:p.left,
+      // small per-leg jitter so no two legs (or two horses) move in lockstep
+      phaseJitter: (Math.random()-0.5) * 0.35,
+      rateJitter: 0.92 + Math.random()*0.16,
+      ampJitter: 0.9 + Math.random()*0.2
+    });
   });
+
 
   g.userData.legs = legs;
   return g;
+}
+
+// shifts a hex color's brightness by a factor in [-1, 1] (negative = darker)
+function shadeColor(hex, factor){
+  const r = (hex >> 16) & 0xff, gC = (hex >> 8) & 0xff, b = hex & 0xff;
+  const adj = (c) => Math.max(0, Math.min(255, Math.round(c + (factor < 0 ? c * factor : (255 - c) * factor))));
+  return (adj(r) << 16) | (adj(gC) << 8) | adj(b);
 }
 
 function spawnHorse(){
@@ -1027,6 +1197,7 @@ function updateHorse(h, dt, t){
     hp.x += dir.x * targetSpeed * dt;
     hp.z += dir.z * targetSpeed * dt;
     clampToWorld(hp);
+    resolveObstacleCollisions(hp, HORSE_BODY_RADIUS);
     const targetYaw = Math.atan2(dir.x, dir.z) - Math.PI/2;
     // smooth turn
     let cur = h.mesh.rotation.y;
@@ -1034,16 +1205,46 @@ function updateHorse(h, dt, t){
     h.mesh.rotation.y = cur + diff * Math.min(1, dt*6);
   }
 
-  // leg gallop bob (purely cosmetic)
-  const gallop = targetSpeed > HORSE_CALM_SPEED + 0.1;
-  const bobSpeed = gallop ? 14 : 5;
-  h.bobPhase += dt * bobSpeed;
+  // leg gallop/walk gait — each leg gets its own phase so all four move
+  // independently instead of the front pair / back pair snapping in unison.
+  // Only animates while the horse is actually moving; otherwise the legs
+  // ease back to a relaxed standing pose instead of endlessly bobbing in place.
+  const moving = targetSpeed > 0.01;
   const legs = h.mesh.userData.legs;
-  legs.forEach((leg, i) => {
-    const offset = (i % 2 === 0) ? 0 : Math.PI;
-    leg.rotation.x = Math.sin(h.bobPhase + offset) * (gallop ? 0.55 : 0.22);
-  });
-  h.mesh.position.y = Math.abs(Math.sin(h.bobPhase*2)) * (gallop ? 0.12 : 0.03);
+
+  if(moving){
+    const gallop = targetSpeed > HORSE_CALM_SPEED + 0.1;
+    const bobSpeed = gallop ? 14 : 5;
+    h.bobPhase += dt * bobSpeed;
+    const swingAmp = gallop ? 0.6 : 0.32;
+    const kneeAmp = gallop ? 0.75 : 0.4;
+    legs.forEach((leg) => {
+      // Four-beat stride sequence: diagonal pairs (front-left+hind-right, then
+      // front-right+hind-left) lead about a half-cycle apart, with a small
+      // quarter-beat stagger between the front and hind of each diagonal pair
+      // so legs don't snap together — this is closer to a real walk/gallop
+      // than a simple two-group split.
+      let basePhase = leg.left ? 0 : Math.PI;
+      if(!leg.front) basePhase += Math.PI*0.42;
+      const phase = h.bobPhase * leg.rateJitter + basePhase + leg.phaseJitter;
+      const swing = Math.sin(phase);
+      leg.pivot.rotation.z = swing * swingAmp * leg.ampJitter;
+      // knee folds backward relative to the upper leg during the forward part of the
+      // stride (lifting/tucking the hoof), straightens out on the push-back/plant
+      const kneeBend = Math.max(0, swing) * kneeAmp * leg.ampJitter;
+      leg.kneePivot.rotation.z = -kneeBend;
+    });
+    h.mesh.position.y = Math.max(0, Math.sin(h.bobPhase*2)) * (gallop ? 0.1 : 0.02);
+  } else {
+    // ease all legs and body bob back to neutral so a stopped horse looks
+    // like it's standing still rather than still mid-stride
+    const ease = Math.min(1, dt*8);
+    legs.forEach((leg) => {
+      leg.pivot.rotation.z += (0 - leg.pivot.rotation.z) * ease;
+      leg.kneePivot.rotation.z += (0 - leg.kneePivot.rotation.z) * ease;
+    });
+    h.mesh.position.y += (0 - h.mesh.position.y) * ease;
+  }
 }
 
 // ---------------------------------------------------------------
@@ -1158,6 +1359,7 @@ function catchHorse(h, bagDef){
   S.catchCount += 1;
   showToast(`+$${pay}`);
   refreshHud();
+  saveGame();
 
   setTimeout(() => {
     const idx = horses.indexOf(h);
@@ -1237,7 +1439,7 @@ function renderShop(){
       btn.disabled = true;
     } else if(owned){
       btn.textContent = 'Equip';
-      btn.onclick = () => { S.equippedBagId = bag.id; refreshHud(); renderShop(); };
+      btn.onclick = () => { S.equippedBagId = bag.id; refreshHud(); renderShop(); saveGame(); };
     } else {
       btn.textContent = `$${bag.price.toLocaleString()}`;
       btn.disabled = S.cash < bag.price;
@@ -1249,6 +1451,7 @@ function renderShop(){
           refreshHud();
           renderShop();
           showToast(`Bought ${bag.name}!`);
+          saveGame();
         }
       };
     }
@@ -1267,6 +1470,7 @@ function openShop(){
 }
 function closeShop(){
   shopOverlay.classList.remove('open');
+  requestLookControl();
 }
 document.getElementById('shopBtn').addEventListener('click', openShop);
 document.getElementById('closeShop').addEventListener('click', closeShop);
@@ -1371,6 +1575,15 @@ const TOUCH_LOOK_SENS = 0.0044;
 // ---------------------------------------------------------------
 // START SCREEN
 // ---------------------------------------------------------------
+if(S.cash > 0 || S.catchCount > 0 || S.ownedBags.size > 1){
+  const statusEl = document.getElementById('saveStatus');
+  if(statusEl){
+    statusEl.textContent = `Saved progress found — $${S.cash.toLocaleString()}, ${equippedBag().name}`;
+  }
+  const startBtnEl = document.getElementById('startBtn');
+  if(startBtnEl) startBtnEl.textContent = 'Continue';
+}
+
 document.getElementById('startBtn').addEventListener('click', () => {
   document.getElementById('startScreen').classList.add('hidden');
   S.started = true;
