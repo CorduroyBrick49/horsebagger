@@ -4,7 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Horse Bagger</title>
-<link rel="icon" type="image/x-icon" href="https://github.com/CorduroyBrick49/horsebagger/blob/main/Horsebagger.ico?raw=true">
 <style>
   :root{
     --leather:#2b1d14;
@@ -186,6 +185,24 @@
   }
   #crosshair::before{ left:50%; top:0; width:2px; height:100%; transform:translateX(-1px); }
   #crosshair::after{ top:50%; left:0; height:2px; width:100%; transform:translateY(-1px); }
+
+  #dragLookHint{
+    position:absolute;
+    top: 90px; left:50%;
+    transform:translateX(-50%);
+    background: rgba(43,29,20,.85);
+    border:2px solid var(--straw);
+    color: var(--parchment);
+    font-size:12px;
+    letter-spacing:1px;
+    text-transform:uppercase;
+    padding:6px 14px;
+    border-radius:6px;
+    white-space:nowrap;
+    display:none;
+    pointer-events:none;
+  }
+  #dragLookHint.show{ display:block; }
 
   /* ---------- Mobile controls ---------- */
   #mobileControls{
@@ -450,6 +467,7 @@
   <div id="cooldownWrap"><div id="cooldownBar"></div></div>
 
   <div id="crosshair"></div>
+  <div id="dragLookHint">Click and drag to look around</div>
 
   <div id="toastLayer"></div>
 </div>
@@ -466,7 +484,7 @@
 <div id="shopOverlay">
   <div id="shopPoster">
     <button id="closeShop">×</button>
-    <div class="poster-eyebrow">★ Genuine Frontier Quality ★</div>
+    <div class="poster-eyebrow">Genuine Frontier Quality</div>
     <div class="poster-title">BAG SHOP</div>
     <div class="poster-sub">"A finer sack means a faster catch" — Old Man Tucker</div>
     <hr class="poster-divider">
@@ -479,14 +497,14 @@
   <div class="tagline">Catch horses. Get paid. Buy better bags.</div>
   <button id="startBtn">Start Bagging</button>
   <div id="howTo">
-    <b>WASD / Arrows</b> to move &nbsp;•&nbsp; <b>Mouse</b> to look &nbsp;•&nbsp; <b>Click / Space</b> to throw your bag<br>
-    Catch horses for cash, then visit the <b>Bag Shop</b> to buy bags with special abilities.<br>
+    <b>WASD / Arrows</b> to move &nbsp;&nbsp; <b>Mouse</b> to look &nbsp;&nbsp; <b>Click</b> to throw your bag &nbsp;&nbsp; <b>Space</b> to jump &nbsp;&nbsp; <b>Tab</b> to open the Bag Shop<br>
+    Catch horses for cash, then visit the Bag Shop to buy bags with special abilities.<br>
     On mobile: use the joystick to move, drag to look, tap BAG IT to throw.
   </div>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-  /* ============================================================
+<script>/* ============================================================
    HORSE BAGGER — game.js
    Run the range, throw bags, catch horses, get paid, upgrade.
    ============================================================ */
@@ -728,20 +746,83 @@ function clampToWorld(v){
   v.z = Math.max(-m, Math.min(m, v.z));
 }
 
-// pointer lock + mouse look
+// pointer lock + mouse look (with fallback for sandboxed iframes that block
+// pointer lock — e.g. "Blocked pointer lock ... allow-pointer-lock not set")
 let pointerLocked = false;
+let pointerLockBlocked = false; // true once we know the environment forbids it
+let dragLooking = false;        // fallback: click-and-drag to look when lock is unavailable
+let lastDragX = 0, lastDragY = 0;
+
+function requestLookControl(){
+  if(isTouchDevice()) return;
+  if(pointerLockBlocked){
+    // fallback mode: just rely on drag-to-look, nothing to request
+    return;
+  }
+  try{
+    const p = canvas.requestPointerLock();
+    // requestPointerLock may return a Promise (newer browsers) that rejects
+    // when blocked by a sandboxed iframe missing allow-pointer-lock.
+    if(p && typeof p.catch === 'function'){
+      p.catch((err) => {
+        pointerLockBlocked = true;
+        console.warn('Pointer lock unavailable, falling back to click-drag look:', err && err.message);
+        const hint = document.getElementById('dragLookHint');
+        if(hint) hint.classList.add('show');
+      });
+    }
+  }catch(err){
+    pointerLockBlocked = true;
+    console.warn('Pointer lock unavailable, falling back to click-drag look:', err && err.message);
+  }
+  if(pointerLockBlocked){
+    const hint = document.getElementById('dragLookHint');
+    if(hint) hint.classList.add('show');
+  }
+}
+
 canvas.addEventListener('click', () => {
   if(!S.started) return;
-  if(!isTouchDevice()) canvas.requestPointerLock();
+  requestLookControl();
 });
 document.addEventListener('pointerlockchange', () => {
   pointerLocked = document.pointerLockElement === canvas;
 });
+document.addEventListener('pointerlockerror', () => {
+  pointerLockBlocked = true;
+  const hint = document.getElementById('dragLookHint');
+  if(hint) hint.classList.add('show');
+});
+
+// fallback: click-and-hold (or just move after a click, while mouse button down) to look around
+canvas.addEventListener('mousedown', (e) => {
+  if(!S.started) return;
+  if(pointerLocked) return; // real pointer lock already handles look via movementX/Y
+  dragLooking = true;
+  lastDragX = e.clientX;
+  lastDragY = e.clientY;
+  const hint = document.getElementById('dragLookHint');
+  if(hint) hint.classList.remove('show');
+});
+window.addEventListener('mouseup', () => { dragLooking = false; });
+window.addEventListener('mouseleave', () => { dragLooking = false; });
+
 document.addEventListener('mousemove', (e) => {
-  if(!pointerLocked) return;
-  S.yaw -= e.movementX * MOUSE_SENS;
-  S.pitch -= e.movementY * MOUSE_SENS;
-  S.pitch = Math.max(-1.3, Math.min(1.3, S.pitch));
+  if(pointerLocked){
+    S.yaw -= e.movementX * MOUSE_SENS;
+    S.pitch -= e.movementY * MOUSE_SENS;
+    S.pitch = Math.max(-1.3, Math.min(1.3, S.pitch));
+    return;
+  }
+  if(dragLooking){
+    const dx = e.clientX - lastDragX;
+    const dy = e.clientY - lastDragY;
+    lastDragX = e.clientX;
+    lastDragY = e.clientY;
+    S.yaw -= dx * MOUSE_SENS;
+    S.pitch -= dy * MOUSE_SENS;
+    S.pitch = Math.max(-1.3, Math.min(1.3, S.pitch));
+  }
 });
 const MOUSE_SENS = 0.0022;
 
@@ -778,8 +859,8 @@ function updatePlayer(dt){
   const right = new THREE.Vector3(Math.sin(S.yaw + Math.PI/2), 0, Math.cos(S.yaw + Math.PI/2));
 
   let mx = 0, mz = 0;
-  if(S.keys['KeyS'] || S.keys['ArrowUp']) mz -= 1;
-  if(S.keys['KeyW'] || S.keys['ArrowDown']) mz += 1;
+  if(S.keys['KeyS'] || S.keys['ArrowDown']) mz -= 1;
+  if(S.keys['KeyW'] || S.keys['ArrowUp']) mz += 1;
   if(S.keys['KeyA'] || S.keys['ArrowLeft']) mx -= 1;
   if(S.keys['KeyD'] || S.keys['ArrowRight']) mx += 1;
 
@@ -1107,11 +1188,11 @@ function refreshHud(){
   const ability = equippedBag().ability;
   const pillText = {
     none: 'No special ability',
-    wideNet: '✓ Wide Net — easier catches',
-    rapidThrow: '✓ Rapid Throw — fast cooldown',
-    magnet: '✓ Magnetic Pull — bag curves to horse',
-    goldRush: '✓ Gold Rush — double pay',
-    phantom: '✓ Phantom — speed + net + pull'
+    wideNet: 'Wide Net — easier catches',
+    rapidThrow: 'Rapid Throw — fast cooldown',
+    magnet: 'Magnetic Pull — bag curves to horse',
+    goldRush: 'Gold Rush — double pay',
+    phantom: 'Phantom — speed + net + pull'
   };
   document.getElementById('abilityPill').textContent = pillText[ability] || 'No special ability';
 }
@@ -1191,7 +1272,8 @@ document.getElementById('shopBtn').addEventListener('click', openShop);
 document.getElementById('closeShop').addEventListener('click', closeShop);
 shopOverlay.addEventListener('click', (e) => { if(e.target === shopOverlay) closeShop(); });
 window.addEventListener('keydown', (e) => {
-  if(e.code === 'KeyB' && S.started) {
+  if(e.code === 'Tab' && S.started) {
+    e.preventDefault();
     shopOverlay.classList.contains('open') ? closeShop() : openShop();
   }
   if(e.code === 'Escape' && shopOverlay.classList.contains('open')) closeShop();
@@ -1296,7 +1378,7 @@ document.getElementById('startBtn').addEventListener('click', () => {
   if(isTouchDevice()){
     setupMobileControls();
   } else {
-    canvas.requestPointerLock();
+    requestLookControl();
   }
 });
 
@@ -1322,7 +1404,6 @@ function loop(){
   renderer.render(scene, camera);
 }
 refreshHud();
-loop();
-</script>
+loop();</script>
 </body>
 </html>
